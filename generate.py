@@ -165,6 +165,7 @@ def generate(
     if is_speculative:
         prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
     seq[T] = next_token
+    callback(next_token)
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     accept_counts = [0] * (speculate_k + 1)

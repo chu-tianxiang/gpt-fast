@@ -371,9 +371,9 @@ def linear_forward_int4(x, weight_int4pack, scales_and_zeros, out_features, grou
 def _check_linear_int4_k(k, groupsize = 1, inner_k_tiles = 1):
     return k % groupsize == 0 and k % (inner_k_tiles * 16) == 0
 
-def replace_linear_int4(module, groupsize, inner_k_tiles, padding):
+def replace_linear_int4(module, groupsize, inner_k_tiles, padding, skip_names=[]):
     for name, child in module.named_children():
-        if isinstance(child, nn.Linear):
+        if isinstance(child, nn.Linear) and name not in skip_names:
             if _check_linear_int4_k(child.in_features, groupsize, inner_k_tiles):
                 setattr(module, name, WeightOnlyInt4Linear(
                     child.in_features, child.out_features, bias=False,
@@ -385,7 +385,7 @@ def replace_linear_int4(module, groupsize, inner_k_tiles, padding):
                     groupsize=groupsize, inner_k_tiles=inner_k_tiles, padding=True,
                 ))
         else:
-            replace_linear_int4(child, groupsize, inner_k_tiles, padding)
+            replace_linear_int4(child, groupsize, inner_k_tiles, padding, skip_names)
 
 
 class WeightOnlyInt4QuantHandler:
@@ -401,7 +401,7 @@ class WeightOnlyInt4QuantHandler:
     def create_quantized_state_dict(self):
         cur_state_dict = self.mod.state_dict()
         for fqn, mod in self.mod.named_modules():
-            if isinstance(mod, torch.nn.Linear):
+            if isinstance(mod, torch.nn.Linear) and "output" not in fqn:
                 assert not mod.bias
                 out_features = mod.out_features
                 in_features = mod.in_features
@@ -429,7 +429,7 @@ class WeightOnlyInt4QuantHandler:
         return cur_state_dict
 
     def convert_for_runtime(self):
-        replace_linear_int4(self.mod, self.groupsize, self.inner_k_tiles, self.padding)
+        replace_linear_int4(self.mod, self.groupsize, self.inner_k_tiles, self.padding, ["output"])
         return self.mod
 
 class WeightOnlyInt4GPTQQuantHandler(GPTQQuantHandler):
@@ -446,10 +446,10 @@ class WeightOnlyInt4GPTQQuantHandler(GPTQQuantHandler):
             group_dequantize_tensor_from_qparams(q, qparams[0], qparams[1], 4, groupsize).float()
         self.combine_qparams_list_func = lambda qparams_list: \
             [torch.cat(x, dim=1) for x in zip(*qparams_list)]
-        # skip unless padding=True or its correctly sized
+        # skip unless padding=True or its correctly sized or output layer
         self.skip_layer_func = lambda linear_weight: not (
             _check_linear_int4_k(linear_weight.shape[-1], groupsize, inner_k_tiles) or padding
-        )
+        ) or linear_weight.shape[0] == 32000
         # we need to do the padding here, both for q and the qparams if necessary
         def make_names_and_values_dict_func(q, qparams):
             k = q.shape[1]
@@ -467,7 +467,7 @@ class WeightOnlyInt4GPTQQuantHandler(GPTQQuantHandler):
 
 
     def convert_for_runtime(self):
-        replace_linear_int4(self.mod, self.groupsize, self.inner_k_tiles, self.padding)
+        replace_linear_int4(self.mod, self.groupsize, self.inner_k_tiles, self.padding, ["output"])
         return self.mod
 
 class WeightOnlyInt4Linear(torch.nn.Module):
@@ -503,6 +503,10 @@ class WeightOnlyInt4Linear(torch.nn.Module):
             "scales_and_zeros",
             torch.empty((in_features // groupsize, out_features, 2), dtype=torch.bfloat16)
         )
+        self.register_buffer(
+            'g_idx',
+            torch.tensor([i for i in range(in_features)], dtype=torch.int32)
+        )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         input = input.to(torch.bfloat16)
@@ -510,7 +514,7 @@ class WeightOnlyInt4Linear(torch.nn.Module):
             import torch.nn.functional as F
             input = F.pad(input, pad=(0, self.in_features - self.origin_in_features))
         return linear_forward_int4(
-            input,
+            input[..., self.g_idx],
             self.weight, self.scales_and_zeros, self.out_features, self.groupsize
         )
 
